@@ -1,0 +1,259 @@
+---
+- name: Despliegue de servicios para laboratorio ASO en openSUSE Leap
+  hosts: servidores
+  become: true
+  vars:
+    app_db_user: ramber
+    app_db_pass: ramber
+    app_db_name: appdb
+    samba_user: sambauzer
+    samba_pass: ramber
+    ftp_user: ftpuser
+    ftp_pass: ramber
+    sftp_user: sftpuser
+    sftp_pass: ramber
+    # Cambia por tu subred local antes de habilitar conexiones remotas PostgreSQL.
+    laboratorio_red: "10.210.82.0/24"
+
+  tasks:
+    - name: Instalar paquetes necesarios
+      community.general.zypper:
+        name:
+          - openssh-server
+          - vsftpd
+          - samba
+          - samba-client
+          - postgresql
+          - postgresql-server
+          - python3-psycopg2
+          - firewalld
+          - python3-passlib
+        state: present
+
+    - name: Iniciar firewalld
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    - name: Permitir servicios de laboratorio
+      ansible.posix.firewalld:
+        service: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop:
+        - ssh
+        - ftp
+        - samba
+
+    - name: Abrir puertos pasivos FTP
+      ansible.posix.firewalld:
+        port: 40000-40100/tcp
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Crear usuario FTP
+      ansible.builtin.user:
+        name: "{{ ftp_user }}"
+        password: "{{ ftp_pass | password_hash('sha512') }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+      no_log: true
+
+    - name: Configurar opciones de vsftpd
+      ansible.builtin.lineinfile:
+        path: /etc/vsftpd.conf
+        regexp: "^#?{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: write_enable, value: 'YES' }
+        - { key: local_umask, value: '022' }
+        - { key: chroot_local_user, value: 'YES' }
+        - { key: allow_writeable_chroot, value: 'YES' }
+        - { key: pasv_enable, value: 'YES' }
+        - { key: pasv_min_port, value: '40000' }
+        - { key: pasv_max_port, value: '40100' }
+      notify: Reiniciar vsftpd
+
+    - name: Iniciar vsftpd
+      ansible.builtin.service:
+        name: vsftpd
+        state: started
+        enabled: true
+
+    - name: Crear grupo SFTP
+      ansible.builtin.group:
+        name: sftp_users
+        state: present
+
+    - name: Crear usuario SFTP
+      ansible.builtin.user:
+        name: "{{ sftp_user }}"
+        group: sftp_users
+        home: "/srv/sftp/{{ sftp_user }}"
+        shell: /usr/sbin/nologin
+        password: "{{ sftp_pass | password_hash('sha512') }}"
+        state: present
+      no_log: true
+
+    - name: Crear directorio base SFTP
+      ansible.builtin.file:
+        path: /srv/sftp
+        owner: root
+        group: root
+        mode: '0755'
+        state: directory
+
+    - name: Crear directorio chroot SFTP
+      ansible.builtin.file:
+        path: "/srv/sftp/{{ sftp_user }}"
+        owner: root
+        group: root
+        mode: '0755'
+        state: directory
+
+    - name: Crear directorio uploads SFTP
+      ansible.builtin.file:
+        path: "/srv/sftp/{{ sftp_user }}/uploads"
+        owner: "{{ sftp_user }}"
+        group: sftp_users
+        mode: '0755'
+        state: directory
+
+    - name: Configurar SFTP en archivo independiente
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/90-sftp-laboratorio.conf
+        mode: '0644'
+        content: |
+          Match Group sftp_users
+              ChrootDirectory /srv/sftp/%u
+              ForceCommand internal-sftp
+              PasswordAuthentication yes
+              X11Forwarding no
+              AllowTcpForwarding no
+      notify: Reiniciar sshd
+
+    - name: Iniciar sshd
+      ansible.builtin.service:
+        name: sshd
+        state: started
+        enabled: true
+
+    - name: Crear grupo Samba
+      ansible.builtin.group:
+        name: smbgroup
+        state: present
+
+    - name: Crear usuario Samba
+      ansible.builtin.user:
+        name: "{{ samba_user }}"
+        group: smbgroup
+        shell: /usr/sbin/nologin
+        create_home: false
+        state: present
+
+    - name: Crear directorio compartido Samba
+      ansible.builtin.file:
+        path: /srv/samba/compartido
+        owner: root
+        group: smbgroup
+        mode: '2770'
+        state: directory
+
+    - name: Configurar contraseña Samba de laboratorio
+      ansible.builtin.shell: |
+        set -o pipefail
+        printf '%s\n%s\n' "$SAMBA_PASS" "$SAMBA_PASS" | smbpasswd -a -s "{{ samba_user }}"
+      args:
+        executable: /bin/bash
+      environment:
+        SAMBA_PASS: "{{ samba_pass }}"
+      changed_when: false
+      no_log: true
+
+    - name: Configurar recurso compartido Samba
+      ansible.builtin.blockinfile:
+        path: /etc/samba/smb.conf
+        marker: '# {mark} LABORATORIO ANSIBLE'
+        block: |
+          [Compartido]
+              path = /srv/samba/compartido
+              browseable = yes
+              read only = no
+              guest ok = no
+              valid users = @smbgroup
+              create mask = 0660
+              directory mask = 2770
+      notify: Reiniciar smb
+
+    - name: Iniciar Samba
+      ansible.builtin.service:
+        name: smb
+        state: started
+        enabled: true
+
+    - name: Iniciar PostgreSQL y crear cluster si falta
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Configurar escucha PostgreSQL solo en interfaces locales y red de laboratorio
+      ansible.builtin.lineinfile:
+        path: /var/lib/pgsql/data/postgresql.conf
+        regexp: '^\s*#?\s*listen_addresses\s*='
+        line: "listen_addresses = '*'"
+      notify: Reiniciar postgresql
+
+    - name: Permitir acceso PostgreSQL desde la red de laboratorio
+      ansible.builtin.lineinfile:
+        path: /var/lib/pgsql/data/pg_hba.conf
+        line: "host {{ app_db_name }} {{ app_db_user }} {{ laboratorio_red }} scram-sha-256"
+        state: present
+      notify: Reiniciar postgresql
+
+    - name: Abrir PostgreSQL solo a la red de laboratorio en firewalld
+      ansible.posix.firewalld:
+        rich_rule: "rule family='ipv4' source address='{{ laboratorio_red }}' port port='5432' protocol='tcp' accept"
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Crear usuario de PostgreSQL si falta
+      ansible.builtin.shell: |
+        psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ app_db_user }}'" | grep -q 1 || psql -c "CREATE USER {{ app_db_user }} WITH PASSWORD '{{ app_db_pass }}';"
+      become_user: postgres
+      register: pg_role
+      changed_when: "'CREATE ROLE' in pg_role.stdout"
+      no_log: true
+
+    - name: Crear base de datos si falta
+      ansible.builtin.shell: |
+        psql -tAc "SELECT 1 FROM pg_database WHERE datname='{{ app_db_name }}'" | grep -q 1 || createdb -O "{{ app_db_user }}" "{{ app_db_name }}"
+      become_user: postgres
+      register: pg_db
+      changed_when: pg_db.stdout != ''
+
+  handlers:
+    - name: Reiniciar sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+    - name: Reiniciar vsftpd
+      ansible.builtin.service:
+        name: vsftpd
+        state: restarted
+
+    - name: Reiniciar smb
+      ansible.builtin.service:
+        name: smb
+        state: restarted
+
+    - name: Reiniciar postgresql
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted

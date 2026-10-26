@@ -1,0 +1,320 @@
+---
+- name: Despliegue de servicios para laboratorio ASO en openSUSE Leap 16
+  hosts: servidores
+  become: true
+
+  vars:
+    laboratorio_red: "0.0.0.0/0"
+    app_db_name: "appdb"
+    app_db_user: "ramber"
+    app_db_pass: "ramber"
+    samba_user: "sambauzer"
+    samba_pass: "ramber"
+    ftp_user: "ftpuser"
+    ftp_pass: "ramber"
+    sftp_user: "sftpuser"
+    sftp_pass: "ramber"
+
+  tasks:
+    # 1. PAQUETES Y FIREWALL
+    - name: Instalar todos los paquetes en openSUSE 16
+      ansible.builtin.zypper:
+        name:
+          - openssh
+          - vsftpd
+          - samba
+          - samba-client
+          - postgresql
+          - postgresql-server
+          - python3-psycopg2
+          - apache2
+          - php8
+          - apache2-mod_php8
+          - php8-pgsql
+          - firewalld
+        state: present
+
+    - name: Asegurar que firewalld este activo
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+
+    # 2. APACHE2 + PHP8
+    - name: Habilitar modulo php8 en Apache
+      ansible.builtin.command: a2enmod php8
+      changed_when: false
+      failed_when: false
+      notify: Reiniciar apache2
+
+    - name: Crear pagina index.php de prueba
+      ansible.builtin.copy:
+        dest: /srv/www/htdocs/index.php
+        owner: wwwrun
+        group: www
+        mode: '0644'
+        content: |
+          <?php
+          echo "<h1>Servidor Apache + PHP desplegado con Ansible - Ramber Lopez</h1>";
+          phpinfo();
+          ?>
+
+    - name: Habilitar e iniciar apache2
+      ansible.builtin.service:
+        name: apache2
+        state: started
+        enabled: true
+
+    - name: Abrir HTTP y HTTPS en el firewall
+      ansible.posix.firewalld:
+        service: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop:
+        - http
+        - https
+
+    # 3. POSTGRESQL
+    - name: Iniciar y habilitar PostgreSQL (auto-inicializa en openSUSE 16)
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Crear base de datos en PostgreSQL
+      community.postgresql.postgresql_db:
+        name: "{{ app_db_name }}"
+        state: present
+      become_user: postgres
+
+    - name: Crear usuario de PostgreSQL
+      community.postgresql.postgresql_user:
+        name: "{{ app_db_user }}"
+        password: "{{ app_db_pass }}"
+        db: "{{ app_db_name }}"
+        priv: "ALL"
+        state: present
+      become_user: postgres
+
+    - name: Configurar escucha de red en postgresql.conf
+      ansible.builtin.lineinfile:
+        path: /var/lib/pgsql/data/postgresql.conf
+        regexp: '^#?listen_addresses\s*='
+        line: "listen_addresses = '*'"
+      notify: Reiniciar postgresql
+
+    - name: Permitir acceso remoto en pg_hba.conf
+      ansible.builtin.lineinfile:
+        path: /var/lib/pgsql/data/pg_hba.conf
+        line: "host all all {{ laboratorio_red }} scram-sha-256"
+      notify: Reiniciar postgresql
+
+    - name: Abrir puerto 5432/tcp en firewall
+      ansible.posix.firewalld:
+        port: 5432/tcp
+        permanent: true
+        state: enabled
+        immediate: true
+
+    # 4. SAMBA
+    - name: Crear grupo smbgroup
+      ansible.builtin.group:
+        name: smbgroup
+        state: present
+
+    - name: Crear usuario para Samba
+      ansible.builtin.user:
+        name: "{{ samba_user }}"
+        groups: smbgroup
+        append: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        state: present
+
+    - name: Establecer contraseña SMB
+      ansible.builtin.shell: >
+        (echo '{{ samba_pass }}'; echo '{{ samba_pass }}') | smbpasswd -s -a {{ samba_user }}
+      changed_when: false
+
+    - name: Crear carpeta compartida /srv/samba/compartido
+      ansible.builtin.file:
+        path: /srv/samba/compartido
+        state: directory
+        owner: root
+        group: smbgroup
+        mode: '2770'
+
+    - name: Configurar bloque compartido en /etc/samba/smb.conf
+      ansible.builtin.blockinfile:
+        path: /etc/samba/smb.conf
+        marker: "# {mark} ANSIBLE CONFIGURACION SAMBA"
+        block: |
+          [Compartido]
+          path = /srv/samba/compartido
+          read only = no
+          browsable = yes
+          valid users = @smbgroup
+          force group = smbgroup
+          create mask = 0660
+          directory mask = 0770
+      notify: Reiniciar samba
+
+    - name: Habilitar e iniciar servicio smb
+      ansible.builtin.service:
+        name: smb
+        state: started
+        enabled: true
+
+    - name: Permitir Samba en el firewall
+      ansible.posix.firewalld:
+        service: samba
+        permanent: true
+        state: enabled
+        immediate: true
+
+    # 5. VSFTPD (FTP) Y SFTP
+    - name: Asegurar nologin en /etc/shells para vsftpd
+      ansible.builtin.lineinfile:
+        path: /etc/shells
+        line: "{{ item }}"
+        state: present
+      loop:
+        - /usr/sbin/nologin
+        - /sbin/nologin
+
+    - name: Crear usuario FTP
+      ansible.builtin.user:
+        name: "{{ ftp_user }}"
+        password: "{{ ftp_pass | password_hash('sha512') }}"
+        shell: /usr/sbin/nologin
+        create_home: true
+        state: present
+
+    - name: Configurar /etc/vsftpd.conf
+      ansible.builtin.blockinfile:
+        path: /etc/vsftpd.conf
+        marker: "# {mark} ANSIBLE CONFIGURACION VSFTPD"
+        block: |
+          anonymous_enable=NO
+          local_enable=YES
+          write_enable=YES
+          chroot_local_user=YES
+          allow_writeable_chroot=YES
+          pasv_enable=YES
+          pasv_min_port=40000
+          pasv_max_port=40100
+      notify: Reiniciar vsftpd
+
+    - name: Habilitar e iniciar servicio vsftpd
+      ansible.builtin.service:
+        name: vsftpd
+        state: started
+        enabled: true
+
+    - name: Permitir FTP en firewall
+      ansible.posix.firewalld:
+        service: ftp
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Abrir puertos pasivos 40000-40100/tcp en firewall
+      ansible.posix.firewalld:
+        port: 40000-40100/tcp
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Crear grupo sftpusers
+      ansible.builtin.group:
+        name: sftpusers
+        state: present
+
+    - name: Crear usuario SFTP enjaulado
+      ansible.builtin.user:
+        name: "{{ sftp_user }}"
+        password: "{{ sftp_pass | password_hash('sha512') }}"
+        groups: sftpusers
+        shell: /bin/false
+        home: /srv/sftp/{{ sftp_user }}
+        create_home: false
+        state: present
+
+    - name: Crear directorio raiz Chroot de SFTP
+      ansible.builtin.file:
+        path: /srv/sftp/{{ sftp_user }}
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Crear carpeta uploads dentro del Chroot SFTP
+      ansible.builtin.file:
+        path: /srv/sftp/{{ sftp_user }}/uploads
+        state: directory
+        owner: "{{ sftp_user }}"
+        group: sftpusers
+        mode: '0755'
+
+    - name: Asegurar directorio /etc/ssh/sshd_config.d
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Configurar jaula SFTP en /etc/ssh/sshd_config.d/90-sftp-laboratorio.conf
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/90-sftp-laboratorio.conf
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          Match Group sftpusers
+              ChrootDirectory /srv/sftp/%u
+              ForceCommand internal-sftp
+              X11Forwarding no
+              AllowTcpForwarding no
+              PasswordAuthentication yes
+      notify: Reiniciar sshd
+
+    - name: Habilitar e iniciar sshd
+      ansible.builtin.service:
+        name: sshd
+        state: started
+        enabled: true
+
+    - name: Permitir SSH en el firewall
+      ansible.posix.firewalld:
+        service: ssh
+        permanent: true
+        state: enabled
+        immediate: true
+
+  handlers:
+    - name: Reiniciar apache2
+      ansible.builtin.service:
+        name: apache2
+        state: restarted
+
+    - name: Reiniciar postgresql
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+    - name: Reiniciar samba
+      ansible.builtin.service:
+        name: smb
+        state: restarted
+
+    - name: Reiniciar vsftpd
+      ansible.builtin.service:
+        name: vsftpd
+        state: restarted
+
+    - name: Reiniciar sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
